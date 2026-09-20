@@ -1,0 +1,23 @@
+name: Reconcile RunPod jobs
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reconcile unfinished jobs
+        env:
+          API_BASE_URL: ${{ secrets.POCKETENVY_API_BASE_URL }}
+          CRON_SECRET: ${{ secrets.POCKETENVY_CRON_SECRET }}
+        run: |
+          test -n "$API_BASE_URL"
+          test -n "$CRON_SECRET"
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            "$API_BASE_URL/api/cron/reconcile"

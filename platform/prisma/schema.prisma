@@ -1,0 +1,113 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum LicenseStatus {
+  ACTIVE
+  SUSPENDED
+  REVOKED
+}
+
+enum JobStatus {
+  RESERVED
+  IN_QUEUE
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  CANCELLED
+  TIMED_OUT
+}
+
+enum CreditKind {
+  PURCHASE
+  ADMIN_GRANT
+  JOB_RESERVATION
+  JOB_SETTLEMENT
+  JOB_REFUND
+}
+
+model License {
+  id                 String        @id @default(cuid())
+  email              String
+  keyHash            String        @unique
+  status             LicenseStatus @default(ACTIVE)
+  maxDevices         Int           @default(2)
+  creditBalanceUnits Int           @default(0)
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+  devices            Device[]
+  jobs               RenderJob[]
+  ledger             CreditLedger[]
+
+  @@index([email])
+}
+
+model Device {
+  id           String   @id @default(cuid())
+  licenseId    String
+  deviceHash   String
+  name         String?
+  active       Boolean  @default(true)
+  activatedAt  DateTime @default(now())
+  lastSeenAt   DateTime @default(now())
+  license      License  @relation(fields: [licenseId], references: [id], onDelete: Cascade)
+
+  @@unique([licenseId, deviceHash])
+  @@index([licenseId, active])
+}
+
+model RenderJob {
+  id                   String    @id @default(cuid())
+  licenseId            String
+  clientRequestId      String
+  runpodJobId          String?   @unique
+  status               JobStatus @default(RESERVED)
+  inputKey             String
+  outputKey            String
+  outputFilename       String
+  reservedCreditUnits  Int
+  settledCreditUnits   Int?
+  comp                 Json
+  options              Json
+  error                String?
+  runpodExecutionTimeMs Int?
+  settledAt             DateTime?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+  license               License   @relation(fields: [licenseId], references: [id], onDelete: Cascade)
+  ledger                CreditLedger[]
+
+  @@unique([licenseId, clientRequestId])
+  @@index([licenseId, status])
+  @@index([status, settledAt])
+}
+
+model CreditLedger {
+  id           String     @id @default(cuid())
+  licenseId    String
+  jobId        String?
+  units        Int
+  kind         CreditKind
+  externalRef  String?    @unique
+  note         String?
+  createdAt    DateTime   @default(now())
+  license      License    @relation(fields: [licenseId], references: [id], onDelete: Cascade)
+  job          RenderJob? @relation(fields: [jobId], references: [id], onDelete: SetNull)
+
+  @@index([licenseId, createdAt])
+}
+
+model WebhookEvent {
+  id         String   @id @default(cuid())
+  source     String
+  externalId String
+  payload    Json
+  createdAt  DateTime @default(now())
+
+  @@unique([source, externalId])
+}
