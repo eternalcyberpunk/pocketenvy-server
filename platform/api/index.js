@@ -162,7 +162,10 @@ app.post("/api/v1/jobs", authenticatedRateLimit, requireAuth, asyncRoute(async f
   var licenseId = request.auth.license.id;
   if (!input.inputKey.startsWith("inputs/" + licenseId + "/")) return response.status(400).json({ error: "Input does not belong to this account." });
   var duplicate = await prisma.renderJob.findUnique({ where: { licenseId_clientRequestId: { licenseId: licenseId, clientRequestId: clientRequestId } } });
-  if (duplicate) return response.json({ jobId: duplicate.id, status: duplicate.status, reservedCreditUnits: duplicate.reservedCreditUnits, account: accountView(request.auth.license) });
+  if (duplicate) {
+    var currentLicense = await prisma.license.findUnique({ where: { id: licenseId } });
+    return response.json({ jobId: duplicate.id, status: duplicate.status, reservedCreditUnits: duplicate.reservedCreditUnits, account: accountView(currentLicense || request.auth.license) });
+  }
   var activeCount = await prisma.renderJob.count({ where: { licenseId: licenseId, status: { in: ["RESERVED", "IN_QUEUE", "IN_PROGRESS"] } } });
   if (activeCount >= MAX_ACTIVE) return response.status(429).json({ error: "Active render limit reached. Wait for a job to finish." });
 
@@ -211,16 +214,20 @@ async function settle(job, runpodStatus) {
     var fresh = await tx.renderJob.findUnique({ where: { id: job.id } });
     if (fresh.settledAt) return fresh;
     var completed = status === "COMPLETED";
+    var outputReady = completed && runpodStatus.output && runpodStatus.output.ok === true;
     var executionMs = Number(runpodStatus.executionTime || 0);
-    var actual = completed ? actualCreditUnits(executionMs, fresh.reservedCreditUnits, process.env) : 0;
+    var finalStatus = completed && !outputReady ? "FAILED" : status;
+    var actual = outputReady ? actualCreditUnits(executionMs, fresh.reservedCreditUnits, process.env) : 0;
     var refund = fresh.reservedCreditUnits - actual;
     if (refund > 0) {
       await tx.license.update({ where: { id: fresh.licenseId }, data: { creditBalanceUnits: { increment: refund } } });
       await tx.creditLedger.create({ data: { licenseId: fresh.licenseId, jobId: fresh.id, units: refund,
-        kind: completed ? "JOB_SETTLEMENT" : "JOB_REFUND", note: completed ? "Unused reservation returned" : "Failed job refunded" } });
+        kind: outputReady ? "JOB_SETTLEMENT" : "JOB_REFUND", note: outputReady ? "Unused reservation returned" : "Failed job refunded" } });
     }
-    return tx.renderJob.update({ where: { id: fresh.id }, data: { status: status, settledCreditUnits: actual,
-      runpodExecutionTimeMs: executionMs, error: runpodStatus.error ? JSON.stringify(runpodStatus.error).slice(0, 2000) : null, settledAt: new Date() } });
+    var error = runpodStatus.error ? JSON.stringify(runpodStatus.error).slice(0, 2000) : null;
+    if (completed && !outputReady && !error) error = "Worker completed without confirming an uploaded output.";
+    return tx.renderJob.update({ where: { id: fresh.id }, data: { status: finalStatus, settledCreditUnits: actual,
+      runpodExecutionTimeMs: executionMs, error: error, settledAt: new Date() } });
   });
 }
 

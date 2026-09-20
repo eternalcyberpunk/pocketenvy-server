@@ -24,7 +24,7 @@ jobs:
       - run: npm run check
       - run: npx prisma validate
         env:
-          DATABASE_URL: ******localhost:5432/pocketenvy?schema=public
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/pocketenvy?schema=public
 
   worker:
     runs-on: ubuntu-latest
