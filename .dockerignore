@@ -1,0 +1,7 @@
+.git
+.github
+platform
+**/__pycache__
+**/*.pyc
+**/.env
+**/node_modules
