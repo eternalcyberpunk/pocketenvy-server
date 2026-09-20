@@ -5,7 +5,7 @@ off customer computers.
 
 ## Deploy to Vercel
 
-1. Create a Vercel project whose root directory is `backend/platform`.
+1. Create a Vercel project whose root directory is `platform`.
 2. Add Vercel Postgres (or another PostgreSQL database) and set `DATABASE_URL`.
 3. Copy every variable from `.env.example` into the Vercel project.
 4. Generate every secret independently with at least 32 random bytes.
@@ -25,7 +25,7 @@ For production schema changes, commit Prisma migrations and use
 
 ## Configure RunPod
 
-Build `backend/worker/Dockerfile`, push the image, and create a RunPod Serverless
+Build `worker/Dockerfile`, push the image, and create a RunPod Serverless
 endpoint from it. Set its endpoint ID and API key in Vercel. The API creates
 short-lived storage URLs, so the worker receives no permanent storage keys.
 

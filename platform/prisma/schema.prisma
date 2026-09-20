@@ -42,7 +42,7 @@ model License {
   updatedAt          DateTime      @updatedAt
   devices            Device[]
   jobs               RenderJob[]
-  ledger              CreditLedger[]
+  ledger             CreditLedger[]
 
   @@index([email])
 }
@@ -65,16 +65,16 @@ model RenderJob {
   id                   String    @id @default(cuid())
   licenseId            String
   clientRequestId      String
-  runpodJobId           String?   @unique
+  runpodJobId          String?   @unique
   status               JobStatus @default(RESERVED)
-  inputKey              String
-  outputKey             String
-  outputFilename        String
-  reservedCreditUnits   Int
-  settledCreditUnits    Int?
-  comp                  Json
-  options               Json
-  error                 String?
+  inputKey             String
+  outputKey            String
+  outputFilename       String
+  reservedCreditUnits  Int
+  settledCreditUnits   Int?
+  comp                 Json
+  options              Json
+  error                String?
   runpodExecutionTimeMs Int?
   settledAt             DateTime?
   createdAt             DateTime  @default(now())

@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   platform:
     runs-on: ubuntu-latest
@@ -20,6 +23,8 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npx prisma validate
+        env:
+          DATABASE_URL: ******localhost:5432/pocketenvy?schema=public
 
   worker:
     runs-on: ubuntu-latest

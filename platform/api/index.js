@@ -3,6 +3,7 @@ const crypto = require("crypto");
 const path = require("path");
 const express = require("express");
 const cors = require("cors");
+const rateLimit = require("express-rate-limit");
 const helmet = require("helmet");
 const { z } = require("zod");
 const { prisma } = require("../lib/db");
@@ -27,6 +28,13 @@ app.use(cors({ origin: function (origin, callback) {
 } }));
 app.use(express.json({ limit: "128kb" }));
 
+const authenticatedRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.AUTHENTICATED_RATE_LIMIT_PER_MINUTE || 60),
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
 function safeFilename(value, fallback) {
   var clean = path.basename(String(value || fallback)).replace(/[^a-zA-Z0-9._-]/g, "_");
   return clean.slice(0, 180) || fallback;
@@ -36,6 +44,19 @@ function accountView(license) {
 }
 function asyncRoute(handler) {
   return function (request, response, next) { Promise.resolve(handler(request, response, next)).catch(next); };
+}
+function normalizeJobStatus(status) {
+  switch (String(status || "").toUpperCase()) {
+    case "IN_PROGRESS": return "IN_PROGRESS";
+    case "COMPLETED": return "COMPLETED";
+    case "FAILED": return "FAILED";
+    case "CANCELLED":
+    case "CANCELED": return "CANCELLED";
+    case "TIMED_OUT":
+    case "TIMED OUT":
+    case "TIMEOUT": return "TIMED_OUT";
+    default: return "IN_QUEUE";
+  }
 }
 
 async function requireAuth(request, response, next) {
@@ -82,7 +103,7 @@ app.post("/api/v1/license/activate", asyncRoute(async function (request, respons
 app.get("/api/health", function (_request, response) {
   response.json({ ok: true, service: "pocketenvy-api", version: "1.0.0" });
 });
-app.get("/api/v1/me", requireAuth, asyncRoute(async function (request, response) {
+app.get("/api/v1/me", authenticatedRateLimit, requireAuth, asyncRoute(async function (request, response) {
   var license = await prisma.license.findUnique({ where: { id: request.auth.license.id } });
   response.json(accountView(license));
 }));
@@ -91,7 +112,7 @@ const uploadSchema = z.object({
   filename: z.string().min(1).max(180), contentType: z.string().min(1).max(100),
   fileSizeBytes: z.number().int().positive()
 });
-app.post("/api/v1/uploads", requireAuth, asyncRoute(async function (request, response) {
+app.post("/api/v1/uploads", authenticatedRateLimit, requireAuth, asyncRoute(async function (request, response) {
   var input = uploadSchema.parse(request.body);
   if (input.fileSizeBytes > MAX_UPLOAD) return response.status(413).json({ error: "Master exceeds the upload limit." });
   var filename = safeFilename(input.filename, "master.mov");
@@ -123,7 +144,7 @@ async function refundDispatchFailure(jobId, message) {
   });
 }
 
-app.post("/api/v1/jobs", requireAuth, asyncRoute(async function (request, response) {
+app.post("/api/v1/jobs", authenticatedRateLimit, requireAuth, asyncRoute(async function (request, response) {
   var input = jobSchema.parse(request.body);
   var clientRequestId = String(request.headers["idempotency-key"] || "");
   if (!/^[a-zA-Z0-9-]{16,80}$/.test(clientRequestId)) return response.status(400).json({ error: "A valid Idempotency-Key header is required." });
@@ -170,25 +191,25 @@ app.post("/api/v1/jobs", requireAuth, asyncRoute(async function (request, respon
 }));
 
 async function settle(job, runpodStatus) {
-  var terminal = ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"].includes(runpodStatus.status);
+  var status = normalizeJobStatus(runpodStatus.status);
+  var terminal = ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"].includes(status);
   if (!terminal) {
-    var mapped = runpodStatus.status === "IN_PROGRESS" ? "IN_PROGRESS" : "IN_QUEUE";
-    return prisma.renderJob.update({ where: { id: job.id }, data: { status: mapped } });
+    return prisma.renderJob.update({ where: { id: job.id }, data: { status: status } });
   }
   if (job.settledAt) return job;
   return prisma.$transaction(async function (tx) {
     var fresh = await tx.renderJob.findUnique({ where: { id: job.id } });
     if (fresh.settledAt) return fresh;
-    var completed = runpodStatus.status === "COMPLETED";
+    var completed = status === "COMPLETED";
     var executionMs = Number(runpodStatus.executionTime || 0);
-    var actual = completed ? actualCreditUnits(executionMs, fresh.reservedCreditUnits) : 0;
+    var actual = completed ? actualCreditUnits(executionMs, fresh.reservedCreditUnits, process.env) : 0;
     var refund = fresh.reservedCreditUnits - actual;
     if (refund > 0) {
       await tx.license.update({ where: { id: fresh.licenseId }, data: { creditBalanceUnits: { increment: refund } } });
       await tx.creditLedger.create({ data: { licenseId: fresh.licenseId, jobId: fresh.id, units: refund,
         kind: completed ? "JOB_SETTLEMENT" : "JOB_REFUND", note: completed ? "Unused reservation returned" : "Failed job refunded" } });
     }
-    return tx.renderJob.update({ where: { id: fresh.id }, data: { status: runpodStatus.status, settledCreditUnits: actual,
+    return tx.renderJob.update({ where: { id: fresh.id }, data: { status: status, settledCreditUnits: actual,
       runpodExecutionTimeMs: executionMs, error: runpodStatus.error ? JSON.stringify(runpodStatus.error).slice(0, 2000) : null, settledAt: new Date() } });
   });
 }
@@ -201,7 +222,7 @@ async function refreshJob(job) {
   return settled;
 }
 
-app.get("/api/v1/jobs/:jobId", requireAuth, asyncRoute(async function (request, response) {
+app.get("/api/v1/jobs/:jobId", authenticatedRateLimit, requireAuth, asyncRoute(async function (request, response) {
   var job = await prisma.renderJob.findFirst({ where: { id: request.params.jobId, licenseId: request.auth.license.id } });
   if (!job) return response.status(404).json({ error: "Render job not found." });
   job = await refreshJob(job);
@@ -213,11 +234,15 @@ app.get("/api/v1/jobs/:jobId", requireAuth, asyncRoute(async function (request, 
   response.json(result);
 }));
 
-app.post("/api/v1/jobs/:jobId/cancel", requireAuth, asyncRoute(async function (request, response) {
+app.post("/api/v1/jobs/:jobId/cancel", authenticatedRateLimit, requireAuth, asyncRoute(async function (request, response) {
   var job = await prisma.renderJob.findFirst({ where: { id: request.params.jobId, licenseId: request.auth.license.id } });
   if (!job) return response.status(404).json({ error: "Render job not found." });
-  if (job.runpodJobId && !job.settledAt) await runpod("/cancel/" + encodeURIComponent(job.runpodJobId), { method: "POST" });
-  job = await settle(job, { status: "CANCELLED", error: "Cancelled by customer" });
+  var cancelError = null;
+  if (job.runpodJobId && !job.settledAt) {
+    try { await runpod("/cancel/" + encodeURIComponent(job.runpodJobId), { method: "POST" }); }
+    catch (error) { cancelError = error; }
+  }
+  job = await settle(job, { status: "CANCELLED", error: cancelError ? ("Cancelled locally after remote cancel failed: " + cancelError.message) : "Cancelled by customer" });
   response.json({ jobId: job.id, status: job.status });
 }));
 
