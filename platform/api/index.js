@@ -58,6 +58,16 @@ function normalizeJobStatus(status) {
     default: return "IN_QUEUE";
   }
 }
+function normalizeJobOptions(options) {
+  return {
+    codec: options.codec,
+    quality: options.quality,
+    upscale: options.upscale,
+    interpolate_fps: options.interpolateFps,
+    denoise: options.denoise,
+    sharpen: options.sharpen
+  };
+}
 
 async function requireAuth(request, response, next) {
   try {
@@ -146,6 +156,7 @@ async function refundDispatchFailure(jobId, message) {
 
 app.post("/api/v1/jobs", authenticatedRateLimit, requireAuth, asyncRoute(async function (request, response) {
   var input = jobSchema.parse(request.body);
+  var jobOptions = normalizeJobOptions(input.options);
   var clientRequestId = String(request.headers["idempotency-key"] || "");
   if (!/^[a-zA-Z0-9-]{16,80}$/.test(clientRequestId)) return response.status(400).json({ error: "A valid Idempotency-Key header is required." });
   var licenseId = request.auth.license.id;
@@ -155,7 +166,7 @@ app.post("/api/v1/jobs", authenticatedRateLimit, requireAuth, asyncRoute(async f
   var activeCount = await prisma.renderJob.count({ where: { licenseId: licenseId, status: { in: ["RESERVED", "IN_QUEUE", "IN_PROGRESS"] } } });
   if (activeCount >= MAX_ACTIVE) return response.status(429).json({ error: "Active render limit reached. Wait for a job to finish." });
 
-  var reservedUnits = estimateCreditUnits(input.comp, input.options);
+  var reservedUnits = estimateCreditUnits(input.comp, jobOptions);
   var outputFilename = safeFilename(input.outputFilename, "pocketenvy.mp4").replace(/\.[^.]+$/, "") + ".mp4";
   var outputKey = "outputs/" + licenseId + "/" + crypto.randomUUID() + "-" + outputFilename;
   var job;
@@ -164,7 +175,7 @@ app.post("/api/v1/jobs", authenticatedRateLimit, requireAuth, asyncRoute(async f
       var changed = await tx.license.updateMany({ where: { id: licenseId, status: "ACTIVE", creditBalanceUnits: { gte: reservedUnits } }, data: { creditBalanceUnits: { decrement: reservedUnits } } });
       if (!changed.count) throw Object.assign(new Error("Insufficient render credits."), { statusCode: 402 });
       var created = await tx.renderJob.create({ data: { licenseId: licenseId, clientRequestId: clientRequestId, inputKey: input.inputKey,
-        outputKey: outputKey, outputFilename: outputFilename, reservedCreditUnits: reservedUnits, comp: input.comp, options: input.options } });
+        outputKey: outputKey, outputFilename: outputFilename, reservedCreditUnits: reservedUnits, comp: input.comp, options: jobOptions } });
       await tx.creditLedger.create({ data: { licenseId: licenseId, jobId: created.id, units: -reservedUnits, kind: "JOB_RESERVATION", note: "Render reservation" } });
       return created;
     });
@@ -178,8 +189,7 @@ app.post("/api/v1/jobs", authenticatedRateLimit, requireAuth, asyncRoute(async f
     var outputUrl = await signedPut(job.outputKey, "video/mp4", runpodUrlTtl);
     var queued = await runpod("/run", { method: "POST", body: JSON.stringify({ input: {
       input_url: inputUrl, output_url: outputUrl, output_filename: outputFilename,
-      options: { codec: input.options.codec, quality: input.options.quality, upscale: input.options.upscale,
-        interpolate_fps: input.options.interpolateFps, denoise: input.options.denoise, sharpen: input.options.sharpen }
+      options: job.options
     } }) });
     job = await prisma.renderJob.update({ where: { id: job.id }, data: { runpodJobId: queued.id, status: "IN_QUEUE" } });
   } catch (error) {
@@ -264,9 +274,13 @@ app.post("/api/v1/webhooks/zapier/purchase", asyncRoute(async function (request,
       var license;
       if (input.licenseKey) {
         var hash = licenseKeyHash(input.licenseKey);
-        license = await tx.license.upsert({ where: { keyHash: hash },
-          create: { email: email, keyHash: hash, maxDevices: input.maxDevices || 2 },
-          update: { email: email, status: "ACTIVE", maxDevices: input.maxDevices || undefined } });
+        license = await tx.license.findUnique({ where: { keyHash: hash } });
+        if (license) {
+          if (license.status !== "ACTIVE") throw Object.assign(new Error("License is not active."), { statusCode: 409 });
+          license = await tx.license.update({ where: { id: license.id }, data: { email: email, maxDevices: input.maxDevices || undefined } });
+        } else {
+          license = await tx.license.create({ data: { email: email, keyHash: hash, maxDevices: input.maxDevices || 2 } });
+        }
       } else {
         license = await tx.license.findFirst({ where: { email: email, status: "ACTIVE" }, orderBy: { createdAt: "asc" } });
         if (!license) throw Object.assign(new Error("No active license exists for this email; include licenseKey."), { statusCode: 422 });

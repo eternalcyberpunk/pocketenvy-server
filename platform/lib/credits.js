@@ -8,7 +8,7 @@ function estimateCreditUnits(comp, options, env) {
   var mpSeconds = (width * height / 1000000) * duration;
   var factor = 1;
   if (number(options.upscale, 1) === 2) factor *= 4;
-  if (number(options.interpolateFps, 0) === 60) factor *= 1.8;
+  if (number(options.interpolateFps != null ? options.interpolateFps : options.interpolate_fps, 0) === 60) factor *= 1.8;
   if (options.denoise === true) factor *= 1.12;
   if (options.sharpen === true) factor *= 1.06;
   if (options.codec === "hevc") factor *= 1.15;

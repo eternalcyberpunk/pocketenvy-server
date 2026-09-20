@@ -57,6 +57,7 @@ function loadApp(overrides) {
 
 test("job submission accepts camelCase interpolateFps and queues a job", async function () {
   var license = { id: "lic_123", email: "customer@example.com", creditBalanceUnits: 4000, status: "ACTIVE", maxDevices: 2 };
+  var runpodCall = null;
   var prisma = {
     device: {
       findFirst: async function () { return { id: "device_1", license: license }; },
@@ -93,7 +94,8 @@ test("job submission accepts camelCase interpolateFps and queues a job", async f
               reservedCreditUnits: 1250,
               inputKey: "inputs/lic_123/source.mov",
               outputKey: "outputs/lic_123/result.mp4",
-              outputFilename: "result.mp4"
+              outputFilename: "result.mp4",
+              options: { codec: "h264", quality: 20, upscale: 1, interpolate_fps: 60, denoise: false, sharpen: true }
             };
           }
         },
@@ -101,7 +103,13 @@ test("job submission accepts camelCase interpolateFps and queues a job", async f
       });
     }
   };
-  var app = loadApp({ prisma: prisma });
+  var app = loadApp({
+    prisma: prisma,
+    runpod: async function (route, options) {
+      runpodCall = { route: route, options: options };
+      return { id: "rp_123" };
+    }
+  });
 
   await withServer(app, async function (baseUrl) {
     var response = await fetch(baseUrl + "/api/v1/jobs", {
@@ -123,6 +131,9 @@ test("job submission accepts camelCase interpolateFps and queues a job", async f
     assert.equal(body.jobId, "job_123");
     assert.equal(body.status, "IN_QUEUE");
     assert.equal(body.account.email, "customer@example.com");
+    assert.equal(runpodCall.route, "/run");
+    assert.equal(JSON.parse(runpodCall.options.body).input.options.interpolate_fps, 60);
+    assert.equal("interpolateFps" in JSON.parse(runpodCall.options.body).input.options, false);
   });
 });
 
