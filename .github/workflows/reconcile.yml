@@ -1,17 +1,15 @@
-name: Reconcile RunPod jobs
+name: Reconcile renders and expire storage
 
 on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
-permissions: {}
-
 jobs:
   reconcile:
     runs-on: ubuntu-latest
     steps:
-      - name: Reconcile unfinished jobs
+      - name: Reconcile jobs and purge expired objects
         env:
           API_BASE_URL: ${{ secrets.POCKETENVY_API_BASE_URL }}
           CRON_SECRET: ${{ secrets.POCKETENVY_CRON_SECRET }}

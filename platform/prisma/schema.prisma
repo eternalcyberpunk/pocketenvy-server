@@ -23,6 +23,22 @@ enum JobStatus {
   TIMED_OUT
 }
 
+enum RenderWorkflow {
+  CLOUD_FINISH
+  FULL_PROJECT
+}
+
+enum ComputeTier {
+  ECONOMY
+  STANDARD
+  TURBO
+}
+
+enum RenderProvider {
+  RUNPOD
+  AE_FARM
+}
+
 enum CreditKind {
   PURCHASE
   ADMIN_GRANT
@@ -42,7 +58,8 @@ model License {
   updatedAt          DateTime      @updatedAt
   devices            Device[]
   jobs               RenderJob[]
-  ledger             CreditLedger[]
+  ledger              CreditLedger[]
+  uploads             Upload[]
 
   @@index([email])
 }
@@ -65,17 +82,27 @@ model RenderJob {
   id                   String    @id @default(cuid())
   licenseId            String
   clientRequestId      String
-  runpodJobId          String?   @unique
+  providerJobId         String?   @unique
+  provider              RenderProvider
+  providerLocation      String
+  workflow              RenderWorkflow
+  computeTier           ComputeTier
   status               JobStatus @default(RESERVED)
-  inputKey             String
-  outputKey            String
-  outputFilename       String
-  reservedCreditUnits  Int
-  settledCreditUnits   Int?
-  comp                 Json
-  options              Json
-  error                String?
-  runpodExecutionTimeMs Int?
+  inputKey              String
+  outputKey             String
+  outputFilename        String
+  reservedCreditUnits   Int
+  settledCreditUnits    Int?
+  comp                  Json
+  options               Json
+  pricing               Json
+  receiptKey            String
+  deadlineAt            DateTime
+  error                 String?
+  executionTimeMs       Int?
+  expiresAt             DateTime?
+  purgedAt              DateTime?
+  inputPurgedAt         DateTime?
   settledAt             DateTime?
   createdAt             DateTime  @default(now())
   updatedAt             DateTime  @updatedAt
@@ -85,6 +112,18 @@ model RenderJob {
   @@unique([licenseId, clientRequestId])
   @@index([licenseId, status])
   @@index([status, settledAt])
+  @@index([expiresAt, purgedAt])
+}
+
+model Upload {
+  key           String   @id
+  licenseId     String
+  sizeBytes     BigInt
+  contentType   String
+  createdAt     DateTime @default(now())
+  usedAt        DateTime?
+  license       License @relation(fields: [licenseId], references: [id], onDelete: Cascade)
+  @@index([licenseId, usedAt])
 }
 
 model CreditLedger {

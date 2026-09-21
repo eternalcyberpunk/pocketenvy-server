@@ -2,7 +2,8 @@ FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg python3 python3-pip ca-certificates \
@@ -11,7 +12,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip3 install --break-system-packages --no-cache-dir -r requirements.txt
-COPY handler.py .
+COPY *.py .
 
 CMD ["python3", "-u", "handler.py"]
 
