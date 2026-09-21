@@ -42,10 +42,15 @@ def extract_package(source, directory):
     if not manifest_path.is_file(): raise ValueError("Project manifest is missing.")
     if manifest_path.stat().st_size > 4*1024**2: raise ValueError("Project manifest is too large.")
     manifest = json.loads(manifest_path.read_text("utf-8"))
+    if not isinstance(manifest, dict): raise ValueError("Project manifest is invalid.")
     if manifest.get("version") != 2: raise ValueError("Unsupported project package version.")
-    project = contained(directory, manifest["project"])
+    project_name = manifest.get("project")
+    assets = manifest.get("assets")
+    if not isinstance(project_name, str) or not isinstance(assets, list): raise ValueError("Project manifest is invalid.")
+    project = contained(directory, project_name)
     if project.suffix.lower() not in (".aep",".aepx") or not project.is_file(): raise ValueError("Project file is missing.")
-    for asset in manifest["assets"]:
+    for asset in assets:
+        if not isinstance(asset, dict) or not isinstance(asset.get("packagedPath"), str): raise ValueError("Project manifest is invalid.")
         if not isinstance(asset.get("itemId"),int) or asset["itemId"] <= 0: raise ValueError("Invalid footage identity.")
         if asset.get("role") not in ("source","proxy"): raise ValueError("Invalid footage role.")
         if not contained(directory,asset["packagedPath"]).is_file(): raise ValueError("Collected footage is missing.")

@@ -14,9 +14,10 @@ function storage() {
 }
 function object(key) { return { Bucket:process.env.S3_BUCKET, Key:key }; }
 async function signedPut(key, type, ttl, size) {
+  const hasSize = size != null;
   return getSignedUrl(storage(), new PutObjectCommand({...object(key), ContentType:type,
-    ...(size ? {ContentLength:size} : {})}), {expiresIn:ttl,
-    signableHeaders:new Set(size ? ["content-type","content-length"] : ["content-type"])});
+    ...(hasSize ? {ContentLength:size} : {})}), {expiresIn:ttl,
+    signableHeaders:new Set(hasSize ? ["content-type","content-length"] : ["content-type"])});
 }
 async function signedGet(key, ttl) { return getSignedUrl(storage(), new GetObjectCommand(object(key)), {expiresIn:ttl}); }
 async function head(key) {
