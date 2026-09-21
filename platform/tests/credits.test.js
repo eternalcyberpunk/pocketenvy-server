@@ -15,13 +15,13 @@ test("aspect, resolution, upscale and pixel aspect determine final dimensions",(
   assert.deepEqual(geometry({...comp,width:720,height:480,pixelAspect:1.2},options),{width:864,height:480,fps:24});
 });
 test("reservation includes output workload, service tier and retention",()=>{
-  const normal=quote(comp,options,{});
-  assert.ok(quote(comp,{...options,upscale:2},{}).reservedCreditUnits>normal.reservedCreditUnits);
-  assert.ok(quote(comp,{...options,computeTier:"TURBO"},{}).reservedCreditUnits>normal.reservedCreditUnits);
-  assert.equal(quote(comp,{...options,retentionDays:30},{}).reservedCreditUnits-normal.reservedCreditUnits,290);
+  const normal=quote(comp,base,{});
+  assert.ok(quote(comp,{...base,options:{...options,upscale:2}},{}).reservedCreditUnits>normal.reservedCreditUnits);
+  assert.ok(quote(comp,{...base,workflow:"FULL_PROJECT",computeTier:"TURBO",options:{...options,format:"png_sequence",codec:"png"}},{}).reservedCreditUnits>normal.reservedCreditUnits);
+  assert.equal(quote(comp,{...base,options:{...options,retentionDays:30}},{}).reservedCreditUnits-normal.reservedCreditUnits,290);
 });
 test("settlement uses saved prices and can never exceed the reservation",()=>{
-  const q=quote(comp,options,{});
+  const q=quote(comp,base,{});
   assert.equal(actualCreditUnits(60000000,q.reservedCreditUnits,q.pricing),q.reservedCreditUnits);
   assert.equal(actualCreditUnits(1,q.reservedCreditUnits,q.pricing),250);
 });

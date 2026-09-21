@@ -39,6 +39,7 @@ def extract_package(source, directory):
             target.parent.mkdir(parents=True,exist_ok=True)
             with archive.open(entry) as src, target.open("xb") as dst: shutil.copyfileobj(src,dst,1024**2)
     manifest_path = directory / "pocketenvy-manifest.json"
+    if not manifest_path.is_file(): raise ValueError("Project manifest is missing.")
     if manifest_path.stat().st_size > 4*1024**2: raise ValueError("Project manifest is too large.")
     manifest = json.loads(manifest_path.read_text("utf-8"))
     if manifest.get("version") != 2: raise ValueError("Unsupported project package version.")

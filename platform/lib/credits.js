@@ -1,11 +1,17 @@
 "use strict";
 const { geometry } = require("./render-spec");
 function num(value, fallback) { var n = Number(value); return Number.isFinite(n) && n >= 0 ? n : fallback; }
-function quote(comp, options, env = process.env) {
+function resolveInput(input = {}) {
+  if (input && input.options && typeof input.options === "object")
+    return { options: input.options, workflow: input.workflow || input.options.workflow, computeTier: input.computeTier || input.options.computeTier };
+  return { options: input || {}, workflow: input?.workflow, computeTier: input?.computeTier };
+}
+function quote(comp, input, env = process.env) {
+  const { options, workflow, computeTier } = resolveInput(input);
   const output = geometry(comp, options);
-  const tier = options.computeTier || "STANDARD";
+  const tier = computeTier || "STANDARD";
   const tierFactor = num(env["TIER_" + tier + "_MULTIPLIER"], {ECONOMY:.8,STANDARD:1,TURBO:1.6}[tier]);
-  const workflowFactor = options.workflow === "FULL_PROJECT" ? num(env.FULL_PROJECT_CREDIT_MULTIPLIER, 2.5) : 1;
+  const workflowFactor = workflow === "FULL_PROJECT" ? num(env.FULL_PROJECT_CREDIT_MULTIPLIER, 2.5) : 1;
   const minimum = num(env.MIN_JOB_CREDIT_UNITS, 250);
   const retentionUnits = Math.ceil((options.retentionDays - 1) * num(env.RETENTION_CREDIT_UNITS_PER_DAY, 10));
   let factor = Math.max(1, output.fps / comp.fps);

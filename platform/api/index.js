@@ -134,7 +134,7 @@ function createApp({db = prisma, store = storage, cloud = providers} = {}) {
   app.get("/api/v1/me",requireAuth,(req,res) => res.json(accountView(req.account)));
   app.post("/api/v1/estimate",requireAuth,route(async(req,res) => {
     const input = estimateSchema.parse(req.body); ensureAvailable(input);
-    const result = quote(input.comp,{...input.options,workflow:input.workflow,computeTier:input.computeTier});
+    const result = quote(input.comp,input);
     res.json({estimatedCreditUnits:result.reservedCreditUnits,estimatedCredits:result.reservedCreditUnits/1000,
       output:result.output,retentionCreditUnits:result.pricing.retentionUnits,
       sufficientBalance:req.account.creditBalanceUnits >= result.reservedCreditUnits});
@@ -166,7 +166,7 @@ function createApp({db = prisma, store = storage, cloud = providers} = {}) {
     if (input.workflow === "FULL_PROJECT" && upload.contentType !== "application/zip") throw fail("Full Project requires a project ZIP.",400);
     const object = await store.head(input.inputKey);
     if (!object || BigInt(object.ContentLength) !== upload.sizeBytes || object.ContentLength > MAX_UPLOAD) throw fail("Upload is incomplete or exceeds the file limit.",400);
-    const result = quote(input.comp,{...input.options,workflow:input.workflow,computeTier:input.computeTier});
+    const result = quote(input.comp,input);
     const filename = safeFilename(input.outputFilename).replace(/\.[^.]*$/,"") + "." + formats[input.options.format].extension;
     const outputKey = "outputs/" + req.account.id + "/" + crypto.randomUUID() + "/" + filename;
     const job = await db.$transaction(async tx => {
