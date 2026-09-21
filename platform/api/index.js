@@ -1,341 +1,305 @@
 "use strict";
 const crypto = require("crypto");
-const path = require("path");
 const express = require("express");
 const cors = require("cors");
-const rateLimit = require("express-rate-limit");
 const helmet = require("helmet");
 const { z } = require("zod");
 const { prisma } = require("../lib/db");
-const { normalizeEmail, licenseKeyHash, deviceHash, signSession, verifySession, safeEqual } = require("../lib/auth");
-const { estimateCreditUnits, actualCreditUnits } = require("../lib/credits");
-const { signedPut, signedGet, remove } = require("../lib/storage");
-const { runpod } = require("../lib/runpod");
+const auth = require("../lib/auth");
+const { quote, actualCreditUnits } = require("../lib/credits");
+const { jobSchema, estimateSchema, formats } = require("../lib/options");
+const storage = require("../lib/storage");
+const providers = require("../lib/providers");
+const ACTIVE = ["RESERVED","IN_QUEUE","IN_PROGRESS"];
+const TERMINAL = ["COMPLETED","FAILED","CANCELLED","TIMED_OUT"];
+const MAX_UPLOAD = Math.min(Number(process.env.MAX_UPLOAD_BYTES || 4294967296), 4294967296);
+const fail = (message, statusCode) => Object.assign(new Error(message), {statusCode});
+const accountView = a => ({email:a.email, creditBalanceUnits:a.creditBalanceUnits, status:a.status, maxDevices:a.maxDevices});
+const safeFilename = name => String(name).split(/[\\/]/).pop().replace(/[^a-zA-Z0-9._-]/g,"_").slice(0,160);
+const route = handler => (req,res,next) => Promise.resolve(handler(req,res,next)).catch(next);
 
-const app = express();
-const MAX_UPLOAD = Number(process.env.MAX_UPLOAD_BYTES || 20 * 1024 ** 3);
-const MAX_ACTIVE = Number(process.env.MAX_ACTIVE_JOBS || 2);
-const uploadTtl = Number(process.env.UPLOAD_URL_TTL_SECONDS || 3600);
-const downloadTtl = Number(process.env.DOWNLOAD_URL_TTL_SECONDS || 3600);
-const runpodUrlTtl = Number(process.env.RUNPOD_INPUT_URL_TTL_SECONDS || 21600);
-const allowedOrigins = String(process.env.ALLOWED_ORIGINS || "null").split(",").map(function (v) { return v.trim(); });
-
-app.disable("x-powered-by");
-app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(cors({ origin: function (origin, callback) {
-  if (!origin || origin === "null" || allowedOrigins.includes(origin)) return callback(null, true);
-  callback(new Error("Origin is not allowed."));
-} }));
-app.use(express.json({ limit: "128kb" }));
-
-const authenticatedRateLimit = rateLimit({
-  windowMs: 60 * 1000,
-  limit: Number(process.env.AUTHENTICATED_RATE_LIMIT_PER_MINUTE || 60),
-  standardHeaders: true,
-  legacyHeaders: false
-});
-
-function safeFilename(value, fallback) {
-  var clean = path.basename(String(value || fallback)).replace(/[^a-zA-Z0-9._-]/g, "_");
-  return clean.slice(0, 180) || fallback;
-}
-function accountView(license) {
-  return { email: license.email, creditBalanceUnits: license.creditBalanceUnits, status: license.status, maxDevices: license.maxDevices };
-}
-function asyncRoute(handler) {
-  return function (request, response, next) { Promise.resolve(handler(request, response, next)).catch(next); };
-}
-function normalizeJobStatus(status) {
-  switch (String(status || "").toUpperCase()) {
-    case "IN_PROGRESS": return "IN_PROGRESS";
-    case "COMPLETED": return "COMPLETED";
-    case "FAILED": return "FAILED";
-    case "CANCELLED":
-    case "CANCELED": return "CANCELLED";
-    case "TIMED_OUT":
-    case "TIMED OUT":
-    case "TIMEOUT": return "TIMED_OUT";
-    default: return "IN_QUEUE";
-  }
-}
-function normalizeJobOptions(options) {
-  return {
-    codec: options.codec,
-    quality: options.quality,
-    upscale: options.upscale,
-    interpolate_fps: options.interpolateFps,
-    denoise: options.denoise,
-    sharpen: options.sharpen
-  };
-}
-
-async function requireAuth(request, response, next) {
-  try {
-    var header = String(request.headers.authorization || "");
-    if (!header.startsWith("Bearer ")) return response.status(401).json({ error: "Activation required." });
-    var payload = verifySession(header.slice(7));
-    var device = await prisma.device.findFirst({
-      where: { licenseId: payload.sub, deviceHash: payload.device, active: true }, include: { license: true }
+function createApp({db = prisma, store = storage, cloud = providers} = {}) {
+  const app = express();
+  app.disable("x-powered-by");
+  app.use(helmet({crossOriginResourcePolicy:false}));
+  app.use(cors({origin:(origin, cb) => {
+    const allowed = String(process.env.ALLOWED_ORIGINS || "null").split(",").map(s=>s.trim());
+    cb(null, !origin || allowed.includes(origin));
+  }}));
+  app.use(express.json({limit:"128kb"}));
+  app.use((_req,res,next) => { res.set("Cache-Control","no-store"); next(); });
+  function secret(name) { return (req,res,next) => auth.safeEqual(String(req.headers.authorization || "").replace(/^Bearer\s+/i,""), process.env[name]) ? next() : res.status(401).json({error:"Unauthorized."}); }
+  const requireAuth = route(async (req,res,next) => {
+    let token;
+    try { token = auth.verifySession(String(req.headers.authorization || "").replace(/^Bearer\s+/i,"")); }
+    catch (_) { return res.status(401).json({error:"Activate PocketEnvy again to continue."}); }
+    const device = await db.device.findFirst({where:{licenseId:token.sub,deviceHash:token.device,active:true},include:{license:true}});
+    if (!device || device.license.status !== "ACTIVE") throw fail("License session is inactive.",401);
+    req.account = device.license; next();
+  });
+  // The SQL is constant. IDs are bound parameters, never interpolated SQL.
+  async function lockAccount(tx,id) { await tx.$queryRawUnsafe('SELECT "id" FROM "License" WHERE "id" = $1 FOR UPDATE',id); }
+  async function lockJob(tx,id) { await tx.$queryRawUnsafe('SELECT "id" FROM "RenderJob" WHERE "id" = $1 FOR UPDATE',id); }
+  async function settle(job,status) {
+    if (!TERMINAL.includes(status.status)) {
+      await db.renderJob.updateMany({where:{id:job.id,settledAt:null},
+        data:{status:status.status === "IN_PROGRESS" ? "IN_PROGRESS" : "IN_QUEUE"}});
+      return db.renderJob.findUnique({where:{id:job.id}});
+    }
+    return db.$transaction(async tx => {
+      await lockJob(tx,job.id);
+      const fresh = await tx.renderJob.findUnique({where:{id:job.id}});
+      if (fresh.settledAt) return fresh;
+      const completed = status.status === "COMPLETED";
+      const execution = Math.min(86400000, Math.max(0, Number(status.executionTimeMs || status.executionTime || 0)));
+      const charged = completed ? actualCreditUnits(execution, fresh.reservedCreditUnits, fresh.pricing) : 0;
+      const refund = fresh.reservedCreditUnits - charged;
+      if (refund > 0) {
+        await tx.license.update({where:{id:fresh.licenseId},data:{creditBalanceUnits:{increment:refund}}});
+        await tx.creditLedger.create({data:{licenseId:fresh.licenseId,jobId:fresh.id,units:refund,
+          kind:completed ? "JOB_SETTLEMENT" : "JOB_REFUND",externalRef:"settle:" + fresh.id,
+          note:completed ? "Unused reservation returned" : "Unsuccessful render refunded"}});
+      }
+      return tx.renderJob.update({where:{id:fresh.id},data:{
+        status:status.status,settledCreditUnits:charged,executionTimeMs:execution,settledAt:new Date(),
+        expiresAt:new Date(Date.now() + (completed ? fresh.options.retentionDays : 1) * 86400000),
+        error:completed ? null : "Render " + status.status.toLowerCase().replace("_"," ") + ". Reserved credits returned."
+      }});
     });
-    if (!device || device.license.status !== "ACTIVE") return response.status(401).json({ error: "License session is no longer active." });
-    await prisma.device.update({ where: { id: device.id }, data: { lastSeenAt: new Date() } });
-    request.auth = { license: device.license, device: device };
-    next();
-  } catch (_) { response.status(401).json({ error: "License session expired. Activate again." }); }
-}
-
-const activationSchema = z.object({
-  email: z.string().email().max(320), licenseKey: z.string().min(6).max(256),
-  deviceId: z.string().min(16).max(128), deviceName: z.string().max(120).optional()
-});
-app.post("/api/v1/license/activate", asyncRoute(async function (request, response) {
-  var input = activationSchema.parse(request.body);
-  var email = normalizeEmail(input.email);
-  var keyHash = licenseKeyHash(input.licenseKey);
-  var license = await prisma.license.findUnique({ where: { keyHash: keyHash } });
-  if (!license || normalizeEmail(license.email) !== email || license.status !== "ACTIVE") {
-    return response.status(401).json({ error: "Email or license key is invalid." });
   }
-  var hash = deviceHash(input.deviceId);
-  var existing = await prisma.device.findUnique({ where: { licenseId_deviceHash: { licenseId: license.id, deviceHash: hash } } });
-  if (!existing) {
-    var activeCount = await prisma.device.count({ where: { licenseId: license.id, active: true } });
-    if (activeCount >= license.maxDevices) return response.status(409).json({ error: "Device limit reached. Contact support to reset an activation." });
+  async function refresh(job) {
+    if (job.settledAt) return job;
+    const receipt = await store.readReceipt(job.receiptKey);
+    if (receipt && receipt.jobId === job.id && TERMINAL.includes(receipt.status)) {
+      if (receipt.status === "COMPLETED" && !(await store.head(job.outputKey))) throw fail("Finished file is not yet available. Try again shortly.",503);
+      return settle(job,receipt);
+    }
+    if (job.providerJobId) {
+      try {
+        const status = await cloud.request(job,"status");
+        if (status.status === "COMPLETED") {
+          if (!(await store.head(job.outputKey))) return settle(job,{status:"FAILED"});
+          if (status.output?.status === "FAILED") return settle(job,{status:"FAILED"});
+        }
+        job = await settle(job,status);
+      } catch (error) {
+        if (error.httpStatus !== 404 && Date.now() < +job.deadlineAt) throw fail("Cloud status is temporarily unavailable. Your job is still tracked.",503);
+      }
+    }
+    if (!job.settledAt && Date.now() >= +job.deadlineAt) return settle(job,{status:"TIMED_OUT"});
+    if (!job.settledAt) await db.renderJob.updateMany({where:{id:job.id,settledAt:null},data:{updatedAt:new Date()}});
+    return job;
   }
-  await prisma.device.upsert({
-    where: { licenseId_deviceHash: { licenseId: license.id, deviceHash: hash } },
-    create: { licenseId: license.id, deviceHash: hash, name: input.deviceName || null },
-    update: { active: true, name: input.deviceName || undefined, lastSeenAt: new Date() }
-  });
-  response.json({ token: signSession(license.id, hash), account: accountView(license) });
-}));
-
-app.get("/api/health", function (_request, response) {
-  response.json({ ok: true, service: "pocketenvy-api", version: "1.0.0" });
-});
-app.get("/api/v1/me", authenticatedRateLimit, requireAuth, asyncRoute(async function (request, response) {
-  var license = await prisma.license.findUnique({ where: { id: request.auth.license.id } });
-  response.json(accountView(license));
-}));
-
-const uploadSchema = z.object({
-  filename: z.string().min(1).max(180), contentType: z.string().min(1).max(100),
-  fileSizeBytes: z.number().int().positive()
-});
-app.post("/api/v1/uploads", authenticatedRateLimit, requireAuth, asyncRoute(async function (request, response) {
-  var input = uploadSchema.parse(request.body);
-  if (input.fileSizeBytes > MAX_UPLOAD) return response.status(413).json({ error: "Master exceeds the upload limit." });
-  var filename = safeFilename(input.filename, "master.mov");
-  var key = "inputs/" + request.auth.license.id + "/" + crypto.randomUUID() + "-" + filename;
-  response.status(201).json({
-    inputKey: key,
-    uploadUrl: await signedPut(key, input.contentType, uploadTtl),
-    expiresIn: uploadTtl
-  });
-}));
-
-const jobSchema = z.object({
-  inputKey: z.string().min(10).max(500), outputFilename: z.string().min(1).max(180),
-  comp: z.object({ width: z.number().positive(), height: z.number().positive(), duration: z.number().positive(), fps: z.number().positive(), name: z.string().max(300).optional() }),
-  options: z.object({
-    codec: z.enum(["h264", "hevc", "av1"]), quality: z.number().int().min(12).max(32),
-    upscale: z.union([z.literal(1), z.literal(2)]), interpolateFps: z.union([z.literal(60), z.null()]),
-    denoise: z.boolean(), sharpen: z.boolean()
-  })
-});
-
-async function refundDispatchFailure(jobId, message) {
-  return prisma.$transaction(async function (tx) {
-    var job = await tx.renderJob.findUnique({ where: { id: jobId } });
-    if (!job || job.settledAt) return;
-    await tx.license.update({ where: { id: job.licenseId }, data: { creditBalanceUnits: { increment: job.reservedCreditUnits } } });
-    await tx.creditLedger.create({ data: { licenseId: job.licenseId, jobId: job.id, units: job.reservedCreditUnits, kind: "JOB_REFUND", note: "Dispatch failed" } });
-    await tx.renderJob.update({ where: { id: job.id }, data: { status: "FAILED", error: String(message).slice(0, 2000), settledCreditUnits: 0, settledAt: new Date() } });
-  });
-}
-
-app.post("/api/v1/jobs", authenticatedRateLimit, requireAuth, asyncRoute(async function (request, response) {
-  var input = jobSchema.parse(request.body);
-  var jobOptions = normalizeJobOptions(input.options);
-  var clientRequestId = String(request.headers["idempotency-key"] || "");
-  if (!/^[a-zA-Z0-9-]{16,80}$/.test(clientRequestId)) return response.status(400).json({ error: "A valid Idempotency-Key header is required." });
-  var licenseId = request.auth.license.id;
-  if (!input.inputKey.startsWith("inputs/" + licenseId + "/")) return response.status(400).json({ error: "Input does not belong to this account." });
-  var duplicate = await prisma.renderJob.findUnique({ where: { licenseId_clientRequestId: { licenseId: licenseId, clientRequestId: clientRequestId } } });
-  if (duplicate) {
-    var currentLicense = await prisma.license.findUnique({ where: { id: licenseId } });
-    return response.json({ jobId: duplicate.id, status: duplicate.status, reservedCreditUnits: duplicate.reservedCreditUnits, account: accountView(currentLicense || request.auth.license) });
+  async function view(job) {
+    const expired = job.expiresAt && +job.expiresAt <= Date.now();
+    const result = {jobId:job.id,status:job.status,workflow:job.workflow,computeTier:job.computeTier,
+      outputFilename:job.outputFilename,format:job.options.format,createdAt:job.createdAt,expiresAt:job.expiresAt,
+      reservedCreditUnits:job.reservedCreditUnits,settledCreditUnits:job.settledCreditUnits,
+      error:job.error,downloadUrl:null};
+    if (job.status === "COMPLETED" && !expired && !job.purgedAt) {
+      const ttl = Math.max(1, Math.min(3600, Math.floor((+job.expiresAt - Date.now())/1000)));
+      result.downloadUrl = await store.signedGet(job.outputKey,ttl);
+    }
+    if (expired || job.purgedAt) result.error = "The selected storage period has ended.";
+    return result;
   }
-  var activeCount = await prisma.renderJob.count({ where: { licenseId: licenseId, status: { in: ["RESERVED", "IN_QUEUE", "IN_PROGRESS"] } } });
-  if (activeCount >= MAX_ACTIVE) return response.status(429).json({ error: "Active render limit reached. Wait for a job to finish." });
-
-  var reservedUnits = estimateCreditUnits(input.comp, jobOptions);
-  var outputFilename = safeFilename(input.outputFilename, "pocketenvy.mp4").replace(/\.[^.]+$/, "") + ".mp4";
-  var outputKey = "outputs/" + licenseId + "/" + crypto.randomUUID() + "-" + outputFilename;
-  var job;
-  try {
-    job = await prisma.$transaction(async function (tx) {
-      var changed = await tx.license.updateMany({ where: { id: licenseId, status: "ACTIVE", creditBalanceUnits: { gte: reservedUnits } }, data: { creditBalanceUnits: { decrement: reservedUnits } } });
-      if (!changed.count) throw Object.assign(new Error("Insufficient render credits."), { statusCode: 402 });
-      var created = await tx.renderJob.create({ data: { licenseId: licenseId, clientRequestId: clientRequestId, inputKey: input.inputKey,
-        outputKey: outputKey, outputFilename: outputFilename, reservedCreditUnits: reservedUnits, comp: input.comp, options: jobOptions } });
-      await tx.creditLedger.create({ data: { licenseId: licenseId, jobId: created.id, units: -reservedUnits, kind: "JOB_RESERVATION", note: "Render reservation" } });
+  function ensureAvailable(input) {
+    const selected = cloud.route(input.workflow,input.computeTier);
+    if (!selected || !cloud.capabilities()[input.workflow].includes(input.computeTier))
+      throw fail("This workflow and speed tier is not available yet. Choose an available tier.",503);
+    return selected;
+  }
+  app.get("/api/health", (_req,res) => res.json({ok:true,service:"pocketenvy-api",version:"2.0.0"}));
+  app.get("/api/v1/capabilities", (_req,res) => res.json({workflows:cloud.capabilities(), maxUploadBytes:MAX_UPLOAD,
+    maxDimension:8192,retentionDays:[1,3,7,30]}));
+  const activation = z.object({email:z.string().email().max(320),licenseKey:z.string().min(6).max(256),
+    deviceId:z.string().min(16).max(128),deviceName:z.string().max(120).optional()});
+  app.post("/api/v1/license/activate", route(async(req,res) => {
+    if (!auth.ready())
+      throw fail("PocketEnvy activation is awaiting service setup.",503);
+    const input = activation.parse(req.body); const hash = auth.deviceHash(input.deviceId);
+    const license = await db.$transaction(async tx => {
+      let account = await tx.license.findUnique({where:{keyHash:auth.licenseKeyHash(input.licenseKey)}});
+      if (!account || account.email !== auth.normalizeEmail(input.email) || account.status !== "ACTIVE") throw fail("Email or license key is invalid.",401);
+      await lockAccount(tx,account.id);
+      const existing = await tx.device.findUnique({where:{licenseId_deviceHash:{licenseId:account.id,deviceHash:hash}}});
+      const count = await tx.device.count({where:{licenseId:account.id,active:true}});
+      if (!existing?.active && count >= account.maxDevices) throw fail("Device limit reached. Contact support to reset an activation.",409);
+      await tx.device.upsert({where:{licenseId_deviceHash:{licenseId:account.id,deviceHash:hash}},
+        create:{licenseId:account.id,deviceHash:hash,name:input.deviceName},update:{active:true,name:input.deviceName,lastSeenAt:new Date()}});
+      return account;
+    });
+    res.json({token:auth.signSession(license.id,hash),account:accountView(license)});
+  }));
+  app.get("/api/v1/me",requireAuth,(req,res) => res.json(accountView(req.account)));
+  app.post("/api/v1/estimate",requireAuth,route(async(req,res) => {
+    const input = estimateSchema.parse(req.body); ensureAvailable(input);
+    const result = quote(input.comp,input);
+    res.json({estimatedCreditUnits:result.reservedCreditUnits,estimatedCredits:result.reservedCreditUnits/1000,
+      output:result.output,retentionCreditUnits:result.pricing.retentionUnits,
+      sufficientBalance:req.account.creditBalanceUnits >= result.reservedCreditUnits});
+  }));
+  const uploadSchema = z.object({filename:z.string().min(1).max(180),contentType:z.enum(["video/quicktime","application/octet-stream","application/zip"]),
+    fileSizeBytes:z.number().int().positive().max(MAX_UPLOAD)});
+  app.post("/api/v1/uploads",requireAuth,route(async(req,res) => {
+    const input = uploadSchema.parse(req.body);
+    if (req.account.creditBalanceUnits <= 0) throw fail("Add credits before uploading.",402);
+    const key = "inputs/" + req.account.id + "/" + crypto.randomUUID() + "-" + safeFilename(input.filename);
+    await db.$transaction(async tx => {
+      await lockAccount(tx,req.account.id);
+      const count = await tx.upload.count({where:{licenseId:req.account.id,usedAt:null,createdAt:{gte:new Date(Date.now()-86400000)}}});
+      if (count >= 10) throw fail("Too many pending uploads. Try again later.",429);
+      await tx.upload.create({data:{key,licenseId:req.account.id,contentType:input.contentType,sizeBytes:BigInt(input.fileSizeBytes)}});
+    });
+    res.status(201).json({inputKey:key,uploadUrl:await store.signedPut(key,input.contentType,3600,input.fileSizeBytes),expiresIn:3600});
+  }));
+  app.post("/api/v1/jobs",requireAuth,route(async(req,res) => {
+    const input = jobSchema.parse(req.body);
+    const requestId = String(req.headers["idempotency-key"] || "");
+    if (!/^[a-zA-Z0-9-]{16,80}$/.test(requestId)) throw fail("A valid Idempotency-Key is required.",400);
+    const where = {licenseId_clientRequestId:{licenseId:req.account.id,clientRequestId:requestId}};
+    const duplicate = await db.renderJob.findUnique({where});
+    if (duplicate) return res.json({...await view(duplicate),account:accountView(req.account)});
+    const selected = ensureAvailable(input);
+    const upload = await db.upload.findUnique({where:{key:input.inputKey}});
+    if (!upload || upload.licenseId !== req.account.id || upload.usedAt) throw fail("Select a fresh upload owned by your account.",400);
+    if (input.workflow === "FULL_PROJECT" && upload.contentType !== "application/zip") throw fail("Full Project requires a project ZIP.",400);
+    const object = await store.head(input.inputKey);
+    if (!object || BigInt(object.ContentLength) !== upload.sizeBytes || object.ContentLength > MAX_UPLOAD) throw fail("Upload is incomplete or exceeds the file limit.",400);
+    const result = quote(input.comp,input);
+    const filename = safeFilename(input.outputFilename).replace(/\.[^.]*$/,"") + "." + formats[input.options.format].extension;
+    const outputKey = "outputs/" + req.account.id + "/" + crypto.randomUUID() + "/" + filename;
+    const job = await db.$transaction(async tx => {
+      await lockAccount(tx,req.account.id);
+      const previous = await tx.renderJob.findUnique({where});
+      if (previous) return {previous};
+      const active = await tx.renderJob.count({where:{licenseId:req.account.id,status:{in:ACTIVE}}});
+      if (active >= Number(process.env.MAX_ACTIVE_JOBS || 2)) throw fail("Active render limit reached.",429);
+      const changed = await tx.license.updateMany({where:{id:req.account.id,status:"ACTIVE",creditBalanceUnits:{gte:result.reservedCreditUnits}},
+        data:{creditBalanceUnits:{decrement:result.reservedCreditUnits}}});
+      if (!changed.count) throw fail("Insufficient render credits.",402);
+      const claimed = await tx.upload.updateMany({where:{key:input.inputKey,usedAt:null},data:{usedAt:new Date()}});
+      if (!claimed.count) throw fail("This upload is already in use.",409);
+      const created = await tx.renderJob.create({data:{licenseId:req.account.id,clientRequestId:requestId,inputKey:input.inputKey,
+        outputKey,outputFilename:filename,receiptKey:outputKey + ".receipt.json",...selected,
+        workflow:input.workflow,computeTier:input.computeTier,deadlineAt:new Date(Date.now()+86400000),
+        comp:input.comp,options:input.options,pricing:result.pricing,reservedCreditUnits:result.reservedCreditUnits}});
+      await tx.creditLedger.create({data:{licenseId:req.account.id,jobId:created.id,units:-result.reservedCreditUnits,
+        kind:"JOB_RESERVATION",externalRef:"reserve:" + created.id,note:"Render and storage reservation"}});
       return created;
     });
-  } catch (error) {
-    if (error.statusCode === 402) return response.status(402).json({ error: error.message, requiredCreditUnits: reservedUnits });
-    throw error;
-  }
-
-  try {
-    var inputUrl = await signedGet(job.inputKey, runpodUrlTtl);
-    var outputUrl = await signedPut(job.outputKey, "video/mp4", runpodUrlTtl);
-    var queued = await runpod("/run", { method: "POST", body: JSON.stringify({ input: {
-      input_url: inputUrl, output_url: outputUrl, output_filename: outputFilename,
-      options: job.options
-    } }) });
-    job = await prisma.renderJob.update({ where: { id: job.id }, data: { runpodJobId: queued.id, status: "IN_QUEUE" } });
-  } catch (error) {
-    await refundDispatchFailure(job.id, error.message);
-    return response.status(502).json({ error: "Cloud worker could not be started; credits were refunded." });
-  }
-  var license = await prisma.license.findUnique({ where: { id: licenseId } });
-  response.status(202).json({ jobId: job.id, status: job.status, reservedCreditUnits: reservedUnits, account: accountView(license) });
-}));
-
-async function settle(job, runpodStatus) {
-  var status = normalizeJobStatus(runpodStatus.status);
-  var terminal = ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"].includes(status);
-  if (!terminal) {
-    return prisma.renderJob.update({ where: { id: job.id }, data: { status: status } });
-  }
-  if (job.settledAt) return job;
-  return prisma.$transaction(async function (tx) {
-    var fresh = await tx.renderJob.findUnique({ where: { id: job.id } });
-    if (fresh.settledAt) return fresh;
-    var completed = status === "COMPLETED";
-    var outputReady = completed && runpodStatus.output && runpodStatus.output.ok === true;
-    var executionMs = Number(runpodStatus.executionTime || 0);
-    var finalStatus = completed && !outputReady ? "FAILED" : status;
-    var actual = outputReady ? actualCreditUnits(executionMs, fresh.reservedCreditUnits, process.env) : 0;
-    var refund = fresh.reservedCreditUnits - actual;
-    if (refund > 0) {
-      await tx.license.update({ where: { id: fresh.licenseId }, data: { creditBalanceUnits: { increment: refund } } });
-      await tx.creditLedger.create({ data: { licenseId: fresh.licenseId, jobId: fresh.id, units: refund,
-        kind: outputReady ? "JOB_SETTLEMENT" : "JOB_REFUND", note: outputReady ? "Unused reservation returned" : "Failed job refunded" } });
+    if (job.previous) return res.json(await view(job.previous));
+    let dispatched = false;
+    try {
+      const payload = {job_id:job.id,comp:input.comp,options:input.options,output:result.output,
+        input_url:await store.signedGet(job.inputKey,86400),
+        output_url:await store.signedPut(job.outputKey,formats[input.options.format].mime,86400),
+        receipt_url:await store.signedPut(job.receiptKey,"application/json",86400)};
+      const queued = await cloud.request(job,"run",payload);
+      dispatched = true;
+      await db.renderJob.updateMany({where:{id:job.id,settledAt:null},data:{providerJobId:queued.id,status:"IN_QUEUE"}});
+    } catch (error) {
+      // A lost dispatch response must not cause a second paid render or a false refund.
+      if (!dispatched && !error.uncertain) await settle(job,{status:"FAILED"});
     }
-    var error = runpodStatus.error ? JSON.stringify(runpodStatus.error).slice(0, 2000) : null;
-    if (completed && !outputReady && !error) error = "Worker completed without confirming an uploaded output.";
-    return tx.renderJob.update({ where: { id: fresh.id }, data: { status: finalStatus, settledCreditUnits: actual,
-      runpodExecutionTimeMs: executionMs, error: error, settledAt: new Date() } });
-  });
-}
-
-async function refreshJob(job) {
-  if (!job.runpodJobId || job.settledAt) return job;
-  var status = await runpod("/status/" + encodeURIComponent(job.runpodJobId));
-  var settled = await settle(job, status);
-  if (settled.status === "COMPLETED") remove(settled.inputKey).catch(function () {});
-  return settled;
-}
-
-app.get("/api/v1/jobs/:jobId", authenticatedRateLimit, requireAuth, asyncRoute(async function (request, response) {
-  var job = await prisma.renderJob.findFirst({ where: { id: request.params.jobId, licenseId: request.auth.license.id } });
-  if (!job) return response.status(404).json({ error: "Render job not found." });
-  job = await refreshJob(job);
-  var result = { jobId: job.id, status: job.status, reservedCreditUnits: job.reservedCreditUnits,
-    settledCreditUnits: job.settledCreditUnits, error: job.error };
-  if (job.status === "COMPLETED") result.downloadUrl = await signedGet(job.outputKey, downloadTtl);
-  var license = await prisma.license.findUnique({ where: { id: job.licenseId } });
-  result.account = accountView(license);
-  response.json(result);
-}));
-
-app.post("/api/v1/jobs/:jobId/cancel", authenticatedRateLimit, requireAuth, asyncRoute(async function (request, response) {
-  var job = await prisma.renderJob.findFirst({ where: { id: request.params.jobId, licenseId: request.auth.license.id } });
-  if (!job) return response.status(404).json({ error: "Render job not found." });
-  var cancelError = null;
-  if (job.runpodJobId && !job.settledAt) {
-    try { await runpod("/cancel/" + encodeURIComponent(job.runpodJobId), { method: "POST" }); }
-    catch (error) { cancelError = error; }
-  }
-  job = await settle(job, { status: "CANCELLED", error: cancelError ? ("Cancelled locally after remote cancel failed: " + cancelError.message) : "Cancelled by customer" });
-  response.json({ jobId: job.id, status: job.status });
-}));
-
-const purchaseSchema = z.object({
-  eventId: z.string().min(4).max(200), email: z.string().email().max(320),
-  licenseKey: z.string().min(6).max(256).optional(), credits: z.number().positive().max(100000),
-  productCode: z.string().max(200).optional(), maxDevices: z.number().int().min(1).max(10).optional()
-});
-app.post("/api/v1/webhooks/zapier/purchase", asyncRoute(async function (request, response) {
-  var bearer = String(request.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  if (!safeEqual(bearer, process.env.ZAPIER_WEBHOOK_SECRET)) return response.status(401).json({ error: "Unauthorized webhook." });
-  var input = purchaseSchema.parse(request.body);
-  var email = normalizeEmail(input.email);
-  var units = Math.round(input.credits * 1000);
-  try {
-    var result = await prisma.$transaction(async function (tx) {
-      await tx.webhookEvent.create({ data: { source: "zapier-payhip", externalId: input.eventId,
-        payload: { email: email, credits: input.credits, productCode: input.productCode || null } } });
-      var license;
-      if (input.licenseKey) {
-        var hash = licenseKeyHash(input.licenseKey);
-        license = await tx.license.findUnique({ where: { keyHash: hash } });
-        if (license) {
-          if (license.status !== "ACTIVE") throw Object.assign(new Error("License is not active."), { statusCode: 409 });
-          license = await tx.license.update({ where: { id: license.id }, data: { email: email, maxDevices: input.maxDevices || undefined } });
+    const current = await db.renderJob.findUnique({where:{id:job.id}});
+    const account = await db.license.findUnique({where:{id:req.account.id}});
+    res.status(202).json({...await view(current),account:accountView(account)});
+  }));
+  app.get("/api/v1/jobs",requireAuth,route(async(req,res) => {
+    const jobs = await db.renderJob.findMany({where:{licenseId:req.account.id},orderBy:{createdAt:"desc"},take:20});
+    res.json({jobs:await Promise.all(jobs.map(view))});
+  }));
+  app.get("/api/v1/jobs/:id",requireAuth,route(async(req,res) => {
+    let job = await db.renderJob.findFirst({where:{id:req.params.id,licenseId:req.account.id}});
+    if (!job) throw fail("Render not found.",404);
+    job = await refresh(job);
+    const account = await db.license.findUnique({where:{id:req.account.id}});
+    res.json({...await view(job),account:accountView(account)});
+  }));
+  app.post("/api/v1/jobs/:id/cancel",requireAuth,route(async(req,res) => {
+    let job = await db.renderJob.findFirst({where:{id:req.params.id,licenseId:req.account.id}});
+    if (!job) throw fail("Render not found.",404);
+    if (!job.settledAt) {
+      if (!job.providerJobId) throw fail("Submission is being reconciled. Cancellation is not yet available.",409);
+      await cloud.request(job,"cancel");
+      job = await refresh(job);
+    }
+    res.json(await view(job));
+  }));
+  const purchase = z.object({eventId:z.string().min(4).max(200),email:z.string().email().max(320),
+    licenseKey:z.string().min(6).max(256).optional(),credits:z.coerce.number().min(.001).max(100000),
+    productCode:z.string().max(200).optional(),maxDevices:z.coerce.number().int().min(1).max(10).optional()});
+  app.post("/api/v1/webhooks/zapier/purchase",secret("ZAPIER_WEBHOOK_SECRET"),route(async(req,res) => {
+    if (!auth.ready()) throw fail("License service is awaiting setup.",503);
+    const input = purchase.parse(req.body), email = auth.normalizeEmail(input.email);
+    const eventWhere = {source_externalId:{source:"zapier-payhip",externalId:input.eventId}};
+    if (await db.webhookEvent.findUnique({where:eventWhere})) return res.json({ok:true,duplicate:true});
+    try {
+      const account = await db.$transaction(async tx => {
+        await tx.webhookEvent.create({data:{source:"zapier-payhip",externalId:input.eventId,
+          payload:{email,credits:input.credits,productCode:input.productCode || null}}});
+        let license;
+        if (input.licenseKey) {
+          const keyHash = auth.licenseKeyHash(input.licenseKey);
+          license = await tx.license.findUnique({where:{keyHash}});
+          if (license && (license.email !== email || license.status !== "ACTIVE")) throw fail("License does not match an active purchaser.",409);
+          if (!license) license = await tx.license.create({data:{email,keyHash,maxDevices:input.maxDevices || 2}});
         } else {
-          license = await tx.license.create({ data: { email: email, keyHash: hash, maxDevices: input.maxDevices || 2 } });
+          const matches = await tx.license.findMany({where:{email,status:"ACTIVE"},take:2});
+          if (matches.length !== 1) throw fail("Include licenseKey to identify the license for this purchase.",422);
+          license = matches[0];
         }
-      } else {
-        license = await tx.license.findFirst({ where: { email: email, status: "ACTIVE" }, orderBy: { createdAt: "asc" } });
-        if (!license) throw Object.assign(new Error("No active license exists for this email; include licenseKey."), { statusCode: 422 });
-      }
-      license = await tx.license.update({ where: { id: license.id }, data: { creditBalanceUnits: { increment: units } } });
-      await tx.creditLedger.create({ data: { licenseId: license.id, units: units, kind: "PURCHASE",
-        externalRef: "zapier:" + input.eventId, note: input.productCode || "Payhip credit purchase" } });
-      return license;
-    });
-    response.json({ ok: true, duplicate: false, creditBalanceUnits: result.creditBalanceUnits });
-  } catch (error) {
-    if (error.code === "P2002") return response.json({ ok: true, duplicate: true });
-    if (error.statusCode) return response.status(error.statusCode).json({ error: error.message });
-    throw error;
-  }
-}));
-
-const resetSchema = z.object({
-  email: z.string().email().max(320).optional(), licenseKey: z.string().min(6).max(256).optional()
-}).refine(function (value) { return Boolean(value.email || value.licenseKey); }, { message: "Email or licenseKey is required." });
-app.post("/api/v1/admin/devices/reset", asyncRoute(async function (request, response) {
-  var bearer = String(request.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  if (!safeEqual(bearer, process.env.ADMIN_SECRET)) return response.status(401).json({ error: "Unauthorized admin request." });
-  var input = resetSchema.parse(request.body);
-  var license = input.licenseKey
-    ? await prisma.license.findUnique({ where: { keyHash: licenseKeyHash(input.licenseKey) } })
-    : await prisma.license.findFirst({ where: { email: normalizeEmail(input.email) }, orderBy: { createdAt: "asc" } });
-  if (!license) return response.status(404).json({ error: "License not found." });
-  var result = await prisma.device.updateMany({ where: { licenseId: license.id, active: true }, data: { active: false } });
-  response.json({ ok: true, deactivatedDevices: result.count, email: license.email });
-}));
-
-app.get("/api/cron/reconcile", asyncRoute(async function (request, response) {
-  var bearer = String(request.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  if (!safeEqual(bearer, process.env.CRON_SECRET)) return response.status(401).json({ error: "Unauthorized cron." });
-  var jobs = await prisma.renderJob.findMany({ where: { status: { in: ["IN_QUEUE", "IN_PROGRESS"] }, settledAt: null }, orderBy: { updatedAt: "asc" }, take: 25 });
-  var results = [];
-  for (var job of jobs) {
-    try { var current = await refreshJob(job); results.push({ id: job.id, status: current.status }); }
-    catch (error) { results.push({ id: job.id, error: error.message }); }
-  }
-  response.json({ ok: true, checked: results.length, results: results });
-}));
-
-app.use(function (error, _request, response, _next) {
-  if (error instanceof z.ZodError) return response.status(400).json({ error: "Invalid request payload.", details: error.issues });
-  console.error(error);
-  response.status(500).json({ error: "Unexpected PocketEnvy service error." });
-});
-
-module.exports = app;
+        const units = Math.round(input.credits * 1000);
+        await tx.creditLedger.create({data:{licenseId:license.id,units,kind:"PURCHASE",
+          externalRef:"zapier:" + input.eventId,note:input.productCode || "Credit purchase"}});
+        return tx.license.update({where:{id:license.id},data:{creditBalanceUnits:{increment:units}}});
+      });
+      res.json({ok:true,duplicate:false,creditBalanceUnits:account.creditBalanceUnits});
+    } catch (error) {
+      if (error.code === "P2002" && await db.webhookEvent.findUnique({where:eventWhere})) return res.json({ok:true,duplicate:true});
+      throw error;
+    }
+  }));
+  app.post("/api/v1/admin/devices/reset",secret("ADMIN_SECRET"),route(async(req,res) => {
+    const input = z.object({licenseKey:z.string().min(6).max(256)}).parse(req.body);
+    const license = await db.license.findUnique({where:{keyHash:auth.licenseKeyHash(input.licenseKey)}});
+    if (!license) throw fail("License not found.",404);
+    const changed = await db.device.updateMany({where:{licenseId:license.id,active:true},data:{active:false}});
+    res.json({ok:true,deactivatedDevices:changed.count});
+  }));
+  app.get("/api/cron/reconcile",secret("CRON_SECRET"),route(async(_req,res) => {
+    let reconciled = 0, purged = 0;
+    const until = Date.now()+35000;
+    const jobs = await db.renderJob.findMany({where:{settledAt:null},orderBy:{updatedAt:"asc"},take:25});
+    for (const job of jobs) {
+      if (Date.now() >= until) break;
+      try { await refresh(job); reconciled++; }
+      catch (_) { await db.renderJob.updateMany({where:{id:job.id,settledAt:null},data:{updatedAt:new Date()}}); }
+    }
+    const inputs = await db.renderJob.findMany({where:{settledAt:{not:null},inputPurgedAt:null},take:25});
+    for (const job of inputs) try {
+      if (Date.now() >= until) break;
+      await store.remove(job.inputKey);
+      await db.renderJob.update({where:{id:job.id},data:{inputPurgedAt:new Date()}});
+    } catch (_) {}
+    const expired = await db.renderJob.findMany({where:{settledAt:{not:null},purgedAt:null,expiresAt:{lte:new Date()}},take:25});
+    for (const job of expired) try {
+      if (Date.now() >= until) break;
+      await store.remove(job.outputKey); await store.remove(job.receiptKey);
+      await db.renderJob.update({where:{id:job.id},data:{purgedAt:new Date()}}); purged++;
+    } catch (_) {}
+    const abandoned = await db.upload.findMany({where:{usedAt:null,createdAt:{lt:new Date(Date.now()-86400000)}},take:25});
+    for (const upload of abandoned) try { if (Date.now() >= until) break; await store.remove(upload.key); await db.upload.delete({where:{key:upload.key}}); } catch (_) {}
+    res.json({ok:true,reconciled,purged});
+  }));
+  app.use((error,_req,res,_next) => {
+    if (error instanceof z.ZodError) return res.status(400).json({error:error.issues.map(i=>i.message).join(" "),details:error.issues});
+    if (error.statusCode) return res.status(error.statusCode).json({error:error.message});
+    console.error("PocketEnvy request failed:",error.code || error.name || "unknown");
+    res.status(503).json({error:"PocketEnvy service is temporarily unavailable. Try again shortly."});
+  });
+  return app;
+}
+module.exports = createApp();
+module.exports.createApp = createApp;

@@ -1,0 +1,16 @@
+{
+  "name": "pocketenvy-ae-farm-agent",
+  "version": "2.0.0",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20.6"
+  },
+  "scripts": {
+    "start": "node --env-file=.env server.js",
+    "check": "node --check server.js && node --test tests/*.test.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}

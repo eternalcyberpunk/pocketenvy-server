@@ -10,6 +10,20 @@ permissions:
 jobs:
   platform:
     runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://test:test@localhost:5432/pocketenvy
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: pocketenvy
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d pocketenvy"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     defaults:
       run:
         working-directory: platform
@@ -23,8 +37,7 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npx prisma validate
-        env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/pocketenvy?schema=public
+      - run: npm run db:migrate
 
   worker:
     runs-on: ubuntu-latest
@@ -33,4 +46,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m py_compile worker/handler.py
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: pip install -r ae-farm-agent/requirements.txt
+      - run: python -m unittest discover -s tests -v
+
+  render-node:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ae-farm-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ae-farm-agent/package-lock.json
+      - run: npm ci
+      - run: npm run check
