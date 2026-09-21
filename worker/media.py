@@ -146,7 +146,7 @@ def finish(source, workdir, payload):
         files = sorted(frames.iterdir())
         if not any(p.suffix == ".png" for p in files): raise RuntimeError("No frames were produced.")
         if sum(p.stat().st_size for p in files) > MAX_BYTES: raise ValueError("PNG sequence exceeds transfer limit.")
-        (frames / "sequence.json").write_text(json.dumps({"fps":output["fps"],"width":output["width"],"height":output["height"]}))
+        (frames / "sequence.json").write_text(json.dumps({"fps":output["fps"],"width":output["width"],"height":output["height"]}), encoding="utf-8")
         with zipfile.ZipFile(destination, "w", zipfile.ZIP_STORED, allowZip64=True) as archive:
             for item in sorted(frames.iterdir()): archive.write(item, item.name)
     else:
